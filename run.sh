@@ -1,73 +1,68 @@
-if [ ! -n "$WERCKER_EB_DEPLOY_ACCESS_KEY" ]; then
-  error 'Please specify access-key'
-  exit 1
-fi
+# See what is happening if DEBUG is set.
+[ -n "$DEBUG" ] && set -x
+set -e
 
-if [ ! -n "$WERCKER_EB_DEPLOY_SECRET_KEY" ]; then
-  error 'Please specify secret-key'
-  exit 1
-fi
+function test_app()
+{
+    which $1 &>/dev/null && return;
+    error "Application \"$1\" is required for this app to run"
+    exit 1
+}
 
-if [ ! -n "$WERCKER_EB_DEPLOY_APP_NAME" ]; then
-  error 'Please specify app-name'
-  exit 1
-fi
+function test_set() {
+    [ -n "$(eval echo \$$1)" ] && return;
 
-if [ ! -n "$WERCKER_EB_DEPLOY_ENV_NAME" ]; then
-  error 'Please specify env-name'
-  exit 1
-fi
+    error "FAILURE: Required key \"$2\" has no value."
+    exit 1
+}
 
-if [ ! -n "$WERCKER_EB_DEPLOY_VERSION_LABEL" ]; then
-  error 'Please specify version-label'
-  exit 1
-fi
+# Begin app
+test_app "aws"
+test_app "git"
+test_app "zip"
 
-if [ ! -n "$WERCKER_EB_DEPLOY_S3_BUCKET" ]; then
-  error 'Please specify s3 bucket'
-  exit 1
-fi
+test_set 'WERCKER_EB_BUILD_LOAD_AWS_ACCESS_KEY' 'aws_access_key'
+test_set 'WERCKER_EB_BUILD_LOAD_AWS_REGION' 'aws_region'
+test_set 'WERCKER_EB_BUILD_LOAD_AWS_SECRET_KEY' 'aws_secret_key'
+test_set 'WERCKER_EB_BUILD_LOAD_EB_APP_NAME' 'eb_app_name'
+test_set 'WERCKER_EB_BUILD_LOAD_S3_BUCKET' 's3_bucket'
 
-if [ ! -n "$WERCKER_EB_DEPLOY_S3_KEY" ]; then
-  error 'Please specify s3 key'
-  exit 1
-fi
-
-if [ ! -n "$WERCKER_EB_DEPLOY_REGION" ]; then
-  #set default region as us-east-1
-  export WERCKER_EB_DEPLOY_REGION="us-east-1"
-fi
-
-info 'Installing the AWS CLI...';
-sudo pip install awscli;
-
-
-mkdir -p $HOME/.aws
-echo '[default]' > $HOME/.aws/config
-echo 'output = json' >> $HOME/.aws/config
-echo "region = $WERCKER_EB_DEPLOY_REGION" >> $HOME/.aws/config
-echo "aws_access_key_id = $WERCKER_EB_DEPLOY_ACCESS_KEY" >> $HOME/.aws/config
-echo "aws_secret_access_key = $WERCKER_EB_DEPLOY_SECRET_KEY" >> $HOME/.aws/config
+# Setup the amazon config and populate the default profile
+AWS_CONFIG="$HOME/.aws/config"
+mkdir -p $(dirname $AWS_CONFIG)
+touch $AWS_CONFIG
+chmod 600 $AWS_CONFIG
+cat > $AWS_CONFIG <<EOF
+[default]
+aws_access_key_id = $WERCKER_EB_BUILD_LOAD_AWS_ACCESS_KEY
+aws_secret_access_key = $WERCKER_EB_BUILD_LOAD_AWS_SECRET_KEY
+output = json
+region = $WERCKER_EB_BUILD_LOAD_AWS_REGION
+EOF
 
 
-# set default values for AWS CLI tool
-export AMAZON_ACCESS_KEY_ID=$WERCKER_EB_DEPLOY_ACCESS_KEY
-export AMAZON_SECRET_ACCESS_KEY=$WERCKER_EB_DEPLOY_SECRET_KEY
-export AWS_DEFAULT_REGION=$WERCKER_EB_DEPLOY_REGION
+# Either use the provided version or use the git version.
+GIT_VERSION="$(git describe --always --dirty)"
+VERSION="${WERCKER_EB_BUILD_LOAD_EB_VERSION+$GIT_VERSION}"
+ARCHIVE_NAME="${APPLICATION_NAME}-${VERSION}.zip"
+BUILD_DIR="$(mktemp --dir)"
+ARCHIVE_PATH="${BUILD_DIR}/${ARCHIVE_NAME}"
+S3_URL="s3://${WERCKER_EB_BUILD_LOAD_S3_BUCKET}/${ARCHIVE_NAME}"
 
-# create description for app deployment
-export EB_DESCRIPTION=$WERCKER_EB_DEPLOY_ENV_NAME,$WERCKER_GIT_BRANCH
+# Use a zipexclude file if one is provided.
+ZIP_OPTS="--symlinks -9qr"
+[ -r "$WERCKER_ROOT/.zipexclude" ] && ZIP_OPTS="$ZIP_OPTS -x@.zipexclude"
 
-aws s3 cp --acl private "$WERCKER_EB_DEPLOY_S3_KEY" "s3://$WERCKER_EB_DEPLOY_S3_BUCKET"
+# Do this in a subshell so as not to alter our CWD
+(
+    cd $WERCKER_ROOT &&
+     zip $ZIP_OPTS "${ARCHIVE_PATH}" .
+)
+
+aws s3 cp --acl private "$ARCHIVE_PATH" "$S3_URL"
+rm -rf "$BUILD_DIR"
 
 aws elasticbeanstalk create-application-version \
-    --region $WERCKER_EB_DEPLOY_REGION \
-    --application-name $WERCKER_EB_DEPLOY_APP_NAME \
-    --version-label $WERCKER_EB_DEPLOY_VERSION_LABEL \
-    --description $EB_DESCRIPTION \
-    --source-bundle "{\"S3Bucket\":\"$WERCKER_EB_DEPLOY_S3_BUCKET\", \"S3Key\":\"$WERCKER_EB_DEPLOY_S3_KEY\"}"
-
-aws elasticbeanstalk update-environment \
-    --environment-name $WERCKER_EB_DEPLOY_ENV_NAME \
-    --description $EB_DESCRIPTION,$WERCKER_GIT_COMMIT \
-    --version-label $WERCKER_EB_DEPLOY_VERSION_LABEL
+    --application-name "$WERCKER_EB_BUILD_LOAD_EB_APP_NAME" \
+    --source-bundle "S3Bucket=${S3_BUCKET},S3Key=${ARCHIVE_NAME}" \
+    --version-label "$VERSION" \
